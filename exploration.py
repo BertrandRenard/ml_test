@@ -1,6 +1,4 @@
 import sys
-import gc
-import math
 import numpy as np
 import pandas as pd
 
@@ -8,23 +6,17 @@ pd.set_option("display.max_rows", 200)
 pd.set_option("display.max_columns", 200)
 pd.set_option("display.width", 200)
 
-# -------------------------
-# Réglages
-# -------------------------
-TOP_K = 30               # nb max de colonnes listées dans certains tableaux
-SHOW_TOP_CATS = 10       # nb de modalités les plus fréquentes à afficher
-DATE_COL = "Date"        # nom attendu de la date
-ID_COL = "Id"            # nom de l'identifiant unique
-COMPANY_COL = "Company"  # nom de l'entreprise
+TOP_K = 30
+SHOW_TOP_CATS = 10
+DATE_COL = "Date"
+ID_COL = "Id"                 # ignoré dans toutes les analyses
+COMPANY_COL = "Company"       # ignoré (sur train et test)
 
-# Heuristiques pour types
 CAT_HINTS = {"Currency","Main_FO_Rating","Main_BusinessArea","Main_RiskCountry","Company"}
 NUM_SUFFIX_HINTS = ("_AnnVal","_QrtVal","_norm","%","_pct","_ratio")
 LIKELY_NUM_COLS = {"Close Price","Num share","Mkt Cap","Period Last Market Cap_QrtVal"}
 
-# Règles “sanity check” spécifiques (souples)
 RANGE_RULES = {
-    # ratio : (min_attendu, max_attendu)
     "Gross Profit Margin_AnnVal": (-1.0, 1.0),
     "Net Income Margin_AnnVal": (-1.0, 1.0),
     "Return On Equity%_AnnVal": (-5.0, 5.0),
@@ -42,40 +34,32 @@ def hrule():
 def try_parse_date(df: pd.DataFrame, col: str):
     if col in df.columns:
         df[col] = pd.to_datetime(df[col], errors="coerce")
-    return df
 
 def classify_columns(df: pd.DataFrame):
-    """Renvoie (num_cols, cat_cols, other_cols) par heuristiques + dtype."""
-    cols = list(df.columns)
+    """Renvoie (num_cols, cat_cols, other_cols) — ne considère jamais Id/Date."""
     num_cols, cat_cols, other_cols = [], [], []
-    for c in cols:
-        if c == ID_COL or c == DATE_COL: 
+    for c in df.columns:
+        if c in (ID_COL, DATE_COL):  # exclus
             continue
         dt = df[c].dtype
-        # heuristiques
         if c in CAT_HINTS:
-            cat_cols.append(c)
-            continue
-        if (isinstance(dt, pd.CategoricalDtype) or
-            dt == object and df[c].nunique(dropna=False) <= max(200, int(len(df)*0.01))):
-            # faible cardinalité => probablement catégorielle
-            cat_cols.append(c)
-            continue
-        if np.issubdtype(dt, np.number) or any(c.endswith(suf) for suf in NUM_SUFFIX_HINTS) or c in LIKELY_NUM_COLS:
+            cat_cols.append(c); continue
+        if (pd.api.types.is_categorical_dtype(dt) or
+            (dt == object and df[c].nunique(dropna=False) <= max(200, int(len(df)*0.01)))):
+            cat_cols.append(c); continue
+        if pd.api.types.is_numeric_dtype(dt) or any(c.endswith(s) for s in NUM_SUFFIX_HINTS) or c in LIKELY_NUM_COLS:
             num_cols.append(c)
         elif dt == object:
-            # object volumineux peut être numérique sale
-            # si >95% parsable en float -> num
             sample = df[c].dropna().astype(str).head(1000)
-            parsable = sample.apply(lambda x: x.replace(",","").replace(" ","").replace("%","").replace("\xa0",""))
+            parsable = sample.str.replace(",","", regex=False)\
+                             .str.replace(" ","", regex=False)\
+                             .str.replace("%","", regex=False)\
+                             .str.replace("\xa0","", regex=False)
             ok = 0
             for v in parsable:
-                try:
-                    float(v)
-                    ok += 1
-                except Exception:
-                    pass
-            if len(sample) > 0 and ok/len(sample) >= 0.95:
+                try: float(v); ok += 1
+                except: pass
+            if len(sample)>0 and ok/len(sample) >= 0.95:
                 num_cols.append(c)
             else:
                 cat_cols.append(c)
@@ -88,65 +72,44 @@ def memory_usage(df: pd.DataFrame, name: str):
     print(f"[MEM] {name}: {mem_mb:,.2f} MB")
 
 def load_all():
-    print("Chargement des fichiers CSV…")
+    print("Chargement…")
     X_train = pd.read_csv("X_train_dku.csv", low_memory=False)
     y_train  = pd.read_csv("y_reg_train_dku.csv", low_memory=False)
     X_test  = pd.read_csv("X_test_dku.csv", low_memory=False)
 
     print(f"X_train shape: {X_train.shape}")
     print(f"y_train  shape: {y_train.shape}")
-    print(f"X_test  shape: {X_test.shape}")
+    print(f"X_test   shape: {X_test.shape}")
     memory_usage(X_train, "X_train")
     memory_usage(y_train , "y_train")
-    memory_usage(X_test , "X_test")
+    memory_usage(X_test  , "X_test")
 
-    # parse dates si présent
-    for df, nm in [(X_train,"X_train"), (X_test,"X_test")]:
-        before_na = df[DATE_COL].isna().sum() if DATE_COL in df.columns else "NA"
-        try_parse_date(df, DATE_COL)
-        after_na = df[DATE_COL].isna().sum() if DATE_COL in df.columns else "NA"
-        if DATE_COL in df.columns:
-            print(f"[{nm}] {DATE_COL}: parsed -> NaT count before={before_na}, after={after_na}")
+    try_parse_date(X_train, DATE_COL)
+    try_parse_date(X_test , DATE_COL)
+    if DATE_COL in X_train.columns:
+        print(f"[X_train] {DATE_COL}: NaT={X_train[DATE_COL].isna().sum()}")
+    if DATE_COL in X_test.columns:
+        print(f"[X_test ] {DATE_COL}: NaT={X_test[DATE_COL].isna().sum()}")
 
-    # merge cible
+    # Merge cible
     if ID_COL not in X_train.columns or ID_COL not in y_train.columns:
-        print("[ERREUR] Colonne Id absente. Vérifie les fichiers.")
-        sys.exit(2)
+        print("[ERREUR] Colonne Id absente."); sys.exit(2)
     train = X_train.merge(y_train, on=ID_COL, how="left", validate="1:1")
-    missing_target = train["log_CDS_5Y"].isna().sum() if "log_CDS_5Y" in train.columns else -1
-    print(f"Fusion cible: train shape={train.shape}, valeurs manquantes dans la cible={missing_target}")
+    miss_tgt = train["log_CDS_5Y"].isna().sum() if "log_CDS_5Y" in train.columns else -1
+    print(f"Fusion cible: train shape={train.shape}, NaN cible={miss_tgt}")
     return train, X_test
 
 def basic_integrity_checks(df: pd.DataFrame, name: str):
     hrule()
     print(f"[INTÉGRITÉ] {name}")
-    print("Aperçu colonnes / dtypes:")
+    print("dtypes:")
     print(df.dtypes.sort_index())
     hrule()
-
-    # unicité Id
-    if ID_COL in df.columns:
-        dup = df.duplicated(ID_COL).sum()
-        print(f"Doublons sur {ID_COL}: {dup}")
-    else:
-        print(f"{ID_COL} absent.")
-
-    # doublons (toutes colonnes)
+    # Pas de vérif d'unicité/doublons sur Id (exigence)
+    # Doublons complets (toutes colonnes) — utile mais neutre vis-à-vis d'Id
     dups_all = df.duplicated().sum()
-    print(f"Doublons (toutes colonnes) : {dups_all}")
-
-    # cohérence Company-Date
-    if COMPANY_COL in df.columns and DATE_COL in df.columns:
-        grp = df.groupby([COMPANY_COL, DATE_COL]).size()
-        multi = (grp > 1).sum()
-        print(f"Lignes multiples par ({COMPANY_COL},{DATE_COL}) : {multi}")
-        if multi > 0:
-            print("Top 10 couples en doublon :")
-            print(grp[grp>1].sort_values(ascending=False).head(10))
-    else:
-        print("Colonnes pour contrôle (Company/Date) manquantes.")
-
-    # couverture temporelle
+    print(f"Doublons exacts (toutes colonnes) : {dups_all}")
+    # Couverture temporelle
     if DATE_COL in df.columns:
         print("Couverture temporelle :")
         print(" - min date :", df[DATE_COL].min())
@@ -158,73 +121,59 @@ def basic_integrity_checks(df: pd.DataFrame, name: str):
 def missingness_report(df: pd.DataFrame, name: str, topk=TOP_K):
     hrule()
     print(f"[MANQUANTS] {name}")
-    na = df.isna().mean().sort_values(ascending=False)
+    na = df.drop(columns=[c for c in (ID_COL,) if c in df.columns]).isna().mean().sort_values(ascending=False)
     print("Top colonnes avec valeurs manquantes (taux) :")
     print((na.head(topk)*100).round(2).astype(str) + "%")
     print("Colonnes sans aucun manquant :", int((na==0).sum()), "/", len(na))
-    # patterns simples
-    print("Nombre de lignes totalement vides (hors Id/Date) :", df.drop(columns=[c for c in [ID_COL,DATE_COL] if c in df.columns]).isna().all(axis=1).sum())
+    core = df.drop(columns=[c for c in (ID_COL, DATE_COL) if c in df.columns])
+    print("Lignes totalement vides (hors Id/Date) :", core.isna().all(axis=1).sum())
 
 def cardinality_report(df: pd.DataFrame, name: str, cat_cols):
     hrule()
     print(f"[CARDINALITÉ CATEGORIELLES] {name}")
-    out_lines = []
+    cat_cols = [c for c in cat_cols if c in df.columns and c not in (ID_COL,)]
+    if not cat_cols:
+        print("Aucune colonne catégorielle détectée."); return
+    rows = []
     for c in cat_cols:
-        nun = df[c].nunique(dropna=True)
-        nanr = df[c].isna().mean()*100
-        out_lines.append((c, nun, f"{nanr:.2f}%"))
-    if out_lines:
-        res = pd.DataFrame(out_lines, columns=["col","n_unique","%NaN"]).sort_values("n_unique", ascending=False)
-        print(res.head(TOP_K).to_string(index=False))
-    else:
-        print("Aucune colonne catégorielle détectée.")
-
-    # top modalités
-    for c in cat_cols[:10]:
+        rows.append((c, df[c].nunique(dropna=True), f"{df[c].isna().mean()*100:.2f}%"))
+    res = pd.DataFrame(rows, columns=["col","n_unique","%NaN"]).sort_values("n_unique", ascending=False)
+    print(res.head(TOP_K).to_string(index=False))
+    for c in [x for x in cat_cols if x != COMPANY_COL][:10]:
         print(f"\nTop modalités - {c}:")
         print(df[c].value_counts(dropna=False).head(SHOW_TOP_CATS))
 
 def numeric_summary(df: pd.DataFrame, name: str, num_cols):
     hrule()
     print(f"[RÉSUMÉ NUMÉRIQUES] {name}")
+    use_cols = [c for c in num_cols if c in df.columns and c not in (ID_COL,)]
+    if not use_cols:
+        print("Aucune colonne numérique à résumer."); return
     stats = []
-    for c in num_cols[:]:
-        s = df[c]
-        # ignorer séries entièrement vides
-        if s.notna().sum() == 0:
-            stats.append([c, 0, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, np.nan, "100.00%", "NA", "NA"])
-            continue
-        v = s.replace([np.inf,-np.inf], np.nan)
-        q1 = v.quantile(0.01)
-        q99 = v.quantile(0.99)
+    for c in use_cols:
+        v = pd.to_numeric(df[c], errors="coerce").replace([np.inf,-np.inf], np.nan)
+        cnt = int(v.count())
+        if cnt == 0:
+            stats.append([c,0,np.nan,np.nan,np.nan,np.nan,np.nan,np.nan,"100.00%","0.00%"]); continue
+        q1 = v.quantile(0.01); q99 = v.quantile(0.99)
         stats.append([
-            c,
-            int(v.count()),
-            v.nunique(dropna=True),
-            float(v.min(skipna=True)),
-            float(v.max(skipna=True)),
-            float(v.mean(skipna=True)),
-            float(v.std(skipna=True)),
+            c, cnt, float(v.min()), float(v.max()),
+            float(v.mean()), float(v.std()),
             float(q1) if pd.notna(q1) else np.nan,
             float(q99) if pd.notna(q99) else np.nan,
-            f"{(v.eq(0).mean()*100):.2f}%",
-            f"{(v.lt(0).mean()*100):.2f}%",
-            f"{(v.isna().mean()*100):.2f}%"
+            f"{(v.isna().mean()*100):.2f}%",
+            f"{(v.eq(0).mean()*100):.2f}%"
         ])
-    cols = ["col","count","n_unique","min","max","mean","std","p01","p99","%zero","%neg","%NaN"]
-    dfstats = pd.DataFrame(stats, columns=cols)
-    # ordonner : %NaN desc puis std desc
-    dfstats["_nan"] = dfstats["%NaN"].str.rstrip("%").astype(float)
-    dfstats = dfstats.sort_values(by=["_nan","std"], ascending=[False, False]).drop(columns=["_nan"])
+    cols = ["col","count","min","max","mean","std","p01","p99","%NaN","%zero"]
+    dfstats = pd.DataFrame(stats, columns=cols).sort_values(by=["%NaN","std"], ascending=[False, False])
     print(dfstats.head(TOP_K).to_string(index=False))
 
 def target_report(train: pd.DataFrame):
     hrule()
     print("[CIBLE] log_CDS_5Y (train)")
     if "log_CDS_5Y" not in train.columns:
-        print("Cible absente du train fusionné.")
-        return
-    s = train["log_CDS_5Y"].replace([np.inf,-np.inf], np.nan)
+        print("Cible absente."); return
+    s = pd.to_numeric(train["log_CDS_5Y"], errors="coerce").replace([np.inf,-np.inf], np.nan)
     print(f"Non-nuls : {s.notna().sum()} / {len(s)} ; NaN : {s.isna().sum()}")
     print(f"Min={s.min():.6f} | P1={s.quantile(0.01):.6f} | P50={s.median():.6f} | P99={s.quantile(0.99):.6f} | Max={s.max():.6f} | Mean={s.mean():.6f} | Std={s.std():.6f}")
 
@@ -234,16 +183,16 @@ def range_sanity_checks(df: pd.DataFrame, name: str):
     for col, (lo, hi) in RANGE_RULES.items():
         if col in df.columns:
             s = pd.to_numeric(df[col], errors="coerce")
-            n = len(s)
-            below = (s < lo).sum()
-            above = (s > hi).sum()
-            nan = s.isna().sum()
+            n = len(s); below = (s < lo).sum(); above = (s > hi).sum(); nan = s.isna().sum()
             print(f"{col}: [{lo}, {hi}] | below={below} ({below/n:.2%}) | above={above} ({above/n:.2%}) | NaN={nan} ({nan/n:.2%})")
 
 def compare_train_test_levels(train: pd.DataFrame, test: pd.DataFrame, cat_cols):
     hrule()
     print("[COMPARAISON TRAIN vs TEST - Catégorielles]")
-    for c in cat_cols[:]:
+    cat_cols = [c for c in cat_cols if c not in (ID_COL, COMPANY_COL)]  # exclut Company + Id
+    for c in cat_cols:
+        if c not in train.columns and c not in test.columns: 
+            continue
         tr = set(train[c].dropna().astype(str).unique()) if c in train.columns else set()
         te = set(test[c].dropna().astype(str).unique()) if c in test.columns else set()
         new_in_test = te - tr
@@ -254,85 +203,45 @@ def compare_train_test_levels(train: pd.DataFrame, test: pd.DataFrame, cat_cols)
         if missing_in_test:
             print(f"  -> Exemples absentes (train pas dans test): {list(sorted(missing_in_test))[:SHOW_TOP_CATS]}")
 
-def missing_by_group(df: pd.DataFrame, group_col: str, cols: list, name: str, topk=10):
-    if group_col not in df.columns:
-        return
-    hrule()
-    print(f"[MANQUANTS PAR GROUPE] {name} – groupe={group_col}")
-    res = []
-    for c in cols:
-        m = df[c].isna().mean()
-        if m == 0:
-            continue
-        g = df.groupby(group_col)[c].apply(lambda s: s.isna().mean()).sort_values(ascending=False)
-        res.append((c, g.head(topk)))
-    for c, series in res:
-        print(f"\nColonne: {c} – Top {topk} groupes avec plus de NaN:")
-        print((series*100).round(2).astype(str) + "%")
-
-def per_company_frequency(df: pd.DataFrame, name: str):
-    if COMPANY_COL not in df.columns or DATE_COL not in df.columns:
-        return
-    hrule()
-    print(f"[FRÉQUENCE PAR SOCIÉTÉ] {name}")
-    counts = df.groupby(COMPANY_COL)[DATE_COL].nunique().describe()
-    print("Nb de périodes distinctes par Company (statistiques) :")
-    print(counts.to_string())
-    print("Top 10 sociétés avec le plus de périodes manquantes (en supposant mensuel) :")
-    # estimation “trous” : comparer span temporel et nb points
-    gaps = []
-    for comp, g in df[[COMPANY_COL, DATE_COL]].dropna().groupby(COMPANY_COL):
-        if g[DATE_COL].empty: 
-            continue
-        span = (g[DATE_COL].max() - g[DATE_COL].min()).days/30.44 + 1e-9
-        expected = int(round(span)) + 1
-        observed = g[DATE_COL].nunique()
-        gaps.append((comp, expected - observed))
-    if gaps:
-        gaps = sorted(gaps, key=lambda x: x[1], reverse=True)[:10]
-        print(pd.DataFrame(gaps, columns=["Company","trous_estimes"]).to_string(index=False))
-
 def numeric_vs_target_corr(train: pd.DataFrame, num_cols: list):
-    if "log_CDS_5Y" not in train.columns:
+    if "log_CDS_5Y" not in train.columns: 
         return
     hrule()
     print("[CORRÉLATION SPEARMAN vs CIBLE] (numériques)")
     corr = {}
-    y = train["log_CDS_5Y"]
+    y = pd.to_numeric(train["log_CDS_5Y"], errors="coerce")
     for c in num_cols:
+        if c not in train.columns or c in (ID_COL,):
+            continue
         try:
             rho = train[[c]].assign(y=y).corr(method="spearman").iloc[0,1]
             corr[c] = rho
         except Exception:
             pass
-    corr = pd.Series(corr).dropna().sort_values(key=lambda s: s.abs(), ascending=False)
-    print(corr.head(TOP_K))
+    if corr:
+        s = pd.Series(corr).dropna().sort_values(key=lambda x: x.abs(), ascending=False)
+        print(s.head(TOP_K))
+    else:
+        print("Aucune corrélation calculable.")
 
 def main():
     train, test = load_all()
 
-    # rapports d’intégrité généraux
     basic_integrity_checks(train, "TRAIN (X+y)")
-    basic_integrity_checks(test, "TEST (X)")
+    basic_integrity_checks(test , "TEST (X)")
 
-    # classification colonnes
-    num_cols_tr, cat_cols_tr, other_tr = classify_columns(train)
-    num_cols_te, cat_cols_te, other_te = classify_columns(test)
+    num_tr, cat_tr, _ = classify_columns(train)
+    num_te, cat_te, _ = classify_columns(test)
 
-    hrule()
-    print("[CLASSIFICATION COLONNES] TRAIN")
-    print("Numériques (top):", num_cols_tr[:TOP_K])
-    print("Catégorielles (top):", cat_cols_tr[:TOP_K])
-    print("Autres:", other_tr)
-    hrule()
-    print("[CLASSIFICATION COLONNES] TEST")
-    print("Numériques (top):", num_cols_te[:TOP_K])
-    print("Catégorielles (top):", cat_cols_te[:TOP_K])
-    print("Autres:", other_te)
+    hrule(); print("[CLASSIFICATION COLONNES] TRAIN")
+    print("Numériques (top):", num_tr[:TOP_K])
+    print("Catégorielles (top):", cat_tr[:TOP_K])
 
-    # cohérence colonnes train/test
-    hrule()
-    print("[COHÉRENCE COLONNES TRAIN vs TEST]")
+    hrule(); print("[CLASSIFICATION COLONNES] TEST")
+    print("Numériques (top):", num_te[:TOP_K])
+    print("Catégorielles (top):", cat_te[:TOP_K])
+
+    hrule(); print("[COHÉRENCE COLONNES TRAIN vs TEST]")
     cols_tr = set(train.columns) - {"log_CDS_5Y"}
     cols_te = set(test.columns)
     only_tr = sorted(list(cols_tr - cols_te))
@@ -340,45 +249,24 @@ def main():
     print("Colonnes seulement dans TRAIN (hors cible):", only_tr[:TOP_K])
     print("Colonnes seulement dans TEST:", only_te[:TOP_K])
 
-    # manquants
     missingness_report(train, "TRAIN")
-    missingness_report(test, "TEST")
+    missingness_report(test , "TEST")
 
-    # cardinalité catégorielles
-    # (prendre l’union détectée sur train/test)
-    cat_union = sorted(set(cat_cols_tr).union(cat_cols_te))
+    cat_union = sorted(set(cat_tr).union(cat_te))
     cardinality_report(train, "TRAIN", cat_union)
     cardinality_report(test , "TEST" , cat_union)
 
-    # numériques – résumés
-    num_union = sorted(set(num_cols_tr).union(num_cols_te))
+    num_union = sorted(set(num_tr).union(num_te))
     numeric_summary(train, "TRAIN", num_union)
-    numeric_summary(test , "TEST" , num_union)
+    numeric_summary(test , "TEST" , num_union)   # robuste si certaines colonnes manquent
 
-    # cible
     target_report(train)
-
-    # sanity checks métiers
     range_sanity_checks(train, "TRAIN")
     range_sanity_checks(test , "TEST")
-
-    # comparaison des niveaux des catégorielles
     compare_train_test_levels(train, test, cat_union)
-
-    # manquants par groupe (si colonnes présentes)
-    for grp in ["Main_RiskCountry","Main_BusinessArea","Currency", COMPANY_COL]:
-        missing_by_group(train, grp, num_union[:TOP_K] + cat_union[:TOP_K], f"TRAIN")
-        missing_by_group(test , grp, num_union[:TOP_K] + cat_union[:TOP_K], f"TEST")
-
-    # fréquences par société
-    per_company_frequency(train, "TRAIN")
-    per_company_frequency(test , "TEST")
-
-    # corrélation numériques vs cible
     numeric_vs_target_corr(train, num_union)
 
-    hrule()
-    print("FIN DU POINT 1 – Tous les logs sont affichés ci-dessus.")
+    hrule(); print("FIN DU POINT 1.")
     hrule()
 
 if __name__ == "__main__":
