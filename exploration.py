@@ -1,4 +1,6 @@
-import sys
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 import numpy as np
 import pandas as pd
 
@@ -6,268 +8,224 @@ pd.set_option("display.max_rows", 200)
 pd.set_option("display.max_columns", 200)
 pd.set_option("display.width", 200)
 
-TOP_K = 30
-SHOW_TOP_CATS = 10
 DATE_COL = "Date"
-ID_COL = "Id"                 # ignoré dans toutes les analyses
-COMPANY_COL = "Company"       # ignoré (sur train et test)
+ID_COL = "Id"  # ignoré
+TARGET = "log_CDS_5Y"
 
-CAT_HINTS = {"Currency","Main_FO_Rating","Main_BusinessArea","Main_RiskCountry","Company"}
-NUM_SUFFIX_HINTS = ("_AnnVal","_QrtVal","_norm","%","_pct","_ratio")
-LIKELY_NUM_COLS = {"Close Price","Num share","Mkt Cap","Period Last Market Cap_QrtVal"}
+CAT_COLS = ["Main_FO_Rating", "Main_BusinessArea", "Main_RiskCountry", "Currency"]
 
-RANGE_RULES = {
-    "Gross Profit Margin_AnnVal": (-1.0, 1.0),
-    "Net Income Margin_AnnVal": (-1.0, 1.0),
-    "Return On Equity%_AnnVal": (-5.0, 5.0),
-    "Return on Assets_AnnVal": (-5.0, 5.0),
-    "Total Debt / Total Capital_AnnVal": (0.0, 2.0),
-    "Long-Term Debt / Total_AnnVal": (0.0, 2.0),
-    "Asset Turnover_QrtVal": (-5.0, 5.0),
-    "FFO Interest Coverage_AnnVal": (-10.0, 100.0),
-    "EBITDA / Interest Expense_QrtVal": (-10.0, 100.0),
-}
+# colonnes macro possibles (sensible aux noms exacts vus dans tes logs)
+MACRO_CANDIDATES = [
+    "Inflation - CPI norm",
+    "labour - unemployement rate norm",
+    "industrial production norm",
+    "Government budget balance norm",
+    "Money supply M1 norm",
+    "Money supply M2 norm",
+    "Consumer confidence norm",
+]
 
-def hrule():
-    print("-"*120)
+def hr():
+    print("-" * 120)
 
-def try_parse_date(df: pd.DataFrame, col: str):
-    if col in df.columns:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
-
-def classify_columns(df: pd.DataFrame):
-    """Renvoie (num_cols, cat_cols, other_cols) — ne considère jamais Id/Date."""
-    num_cols, cat_cols, other_cols = [], [], []
-    for c in df.columns:
-        if c in (ID_COL, DATE_COL):  # exclus
-            continue
-        dt = df[c].dtype
-        if c in CAT_HINTS:
-            cat_cols.append(c); continue
-        if (pd.api.types.is_categorical_dtype(dt) or
-            (dt == object and df[c].nunique(dropna=False) <= max(200, int(len(df)*0.01)))):
-            cat_cols.append(c); continue
-        if pd.api.types.is_numeric_dtype(dt) or any(c.endswith(s) for s in NUM_SUFFIX_HINTS) or c in LIKELY_NUM_COLS:
-            num_cols.append(c)
-        elif dt == object:
-            sample = df[c].dropna().astype(str).head(1000)
-            parsable = sample.str.replace(",","", regex=False)\
-                             .str.replace(" ","", regex=False)\
-                             .str.replace("%","", regex=False)\
-                             .str.replace("\xa0","", regex=False)
-            ok = 0
-            for v in parsable:
-                try: float(v); ok += 1
-                except: pass
-            if len(sample)>0 and ok/len(sample) >= 0.95:
-                num_cols.append(c)
-            else:
-                cat_cols.append(c)
-        else:
-            other_cols.append(c)
-    return sorted(set(num_cols)), sorted(set(cat_cols)), sorted(set(other_cols))
-
-def memory_usage(df: pd.DataFrame, name: str):
-    mem_mb = df.memory_usage(deep=True).sum()/1024**2
-    print(f"[MEM] {name}: {mem_mb:,.2f} MB")
-
-def load_all():
+def load_data():
     print("Chargement…")
     X_train = pd.read_csv("X_train_dku.csv", low_memory=False)
-    y_train  = pd.read_csv("y_reg_train_dku.csv", low_memory=False)
+    y_train = pd.read_csv("y_reg_train_dku.csv", low_memory=False)
     X_test  = pd.read_csv("X_test_dku.csv", low_memory=False)
 
-    print(f"X_train shape: {X_train.shape}")
-    print(f"y_train  shape: {y_train.shape}")
-    print(f"X_test   shape: {X_test.shape}")
-    memory_usage(X_train, "X_train")
-    memory_usage(y_train , "y_train")
-    memory_usage(X_test  , "X_test")
+    # Dates
+    for df, nm in [(X_train, "X_train"), (X_test, "X_test")]:
+        if DATE_COL in df.columns:
+            df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
+            print(f"[{nm}] NaT sur {DATE_COL}: {df[DATE_COL].isna().sum()}")
 
-    try_parse_date(X_train, DATE_COL)
-    try_parse_date(X_test , DATE_COL)
-    if DATE_COL in X_train.columns:
-        print(f"[X_train] {DATE_COL}: NaT={X_train[DATE_COL].isna().sum()}")
-    if DATE_COL in X_test.columns:
-        print(f"[X_test ] {DATE_COL}: NaT={X_test[DATE_COL].isna().sum()}")
-
-    # Merge cible
-    if ID_COL not in X_train.columns or ID_COL not in y_train.columns:
-        print("[ERREUR] Colonne Id absente."); sys.exit(2)
+    # Merge cible dans train
     train = X_train.merge(y_train, on=ID_COL, how="left", validate="1:1")
-    miss_tgt = train["log_CDS_5Y"].isna().sum() if "log_CDS_5Y" in train.columns else -1
-    print(f"Fusion cible: train shape={train.shape}, NaN cible={miss_tgt}")
+
+    print(f"train shape={train.shape} | test shape={X_test.shape}")
     return train, X_test
 
-def basic_integrity_checks(df: pd.DataFrame, name: str):
-    hrule()
-    print(f"[INTÉGRITÉ] {name}")
-    print("dtypes:")
-    print(df.dtypes.sort_index())
-    hrule()
-    # Pas de vérif d'unicité/doublons sur Id (exigence)
-    # Doublons complets (toutes colonnes) — utile mais neutre vis-à-vis d'Id
-    dups_all = df.duplicated().sum()
-    print(f"Doublons exacts (toutes colonnes) : {dups_all}")
-    # Couverture temporelle
-    if DATE_COL in df.columns:
-        print("Couverture temporelle :")
-        print(" - min date :", df[DATE_COL].min())
-        print(" - max date :", df[DATE_COL].max())
-        by_year = df[DATE_COL].dt.year.value_counts().sort_index()
-        print("Répartition par année (top 20):")
-        print(by_year.head(20))
+def coverage(df: pd.DataFrame, name: str):
+    hr()
+    print(f"[COUVERTURE TEMPORELLE] {name}")
+    if DATE_COL not in df.columns:
+        print("Colonne Date absente."); return
+    print("min:", df[DATE_COL].min(), " | max:", df[DATE_COL].max())
+    by_year = df[DATE_COL].dt.year.value_counts().sort_index()
+    print("Répartition par année:")
+    print(by_year.to_string())
 
-def missingness_report(df: pd.DataFrame, name: str, topk=TOP_K):
-    hrule()
-    print(f"[MANQUANTS] {name}")
-    na = df.drop(columns=[c for c in (ID_COL,) if c in df.columns]).isna().mean().sort_values(ascending=False)
-    print("Top colonnes avec valeurs manquantes (taux) :")
-    print((na.head(topk)*100).round(2).astype(str) + "%")
-    print("Colonnes sans aucun manquant :", int((na==0).sum()), "/", len(na))
-    core = df.drop(columns=[c for c in (ID_COL, DATE_COL) if c in df.columns])
-    print("Lignes totalement vides (hors Id/Date) :", core.isna().all(axis=1).sum())
+    by_month = df[DATE_COL].dt.to_period("M").value_counts().sort_index()
+    print("\nTop 10 mois les plus représentés:")
+    print(by_month.sort_values(ascending=False).head(10).to_string())
 
-def cardinality_report(df: pd.DataFrame, name: str, cat_cols):
-    hrule()
-    print(f"[CARDINALITÉ CATEGORIELLES] {name}")
-    cat_cols = [c for c in cat_cols if c in df.columns and c not in (ID_COL,)]
-    if not cat_cols:
-        print("Aucune colonne catégorielle détectée."); return
-    rows = []
-    for c in cat_cols:
-        rows.append((c, df[c].nunique(dropna=True), f"{df[c].isna().mean()*100:.2f}%"))
-    res = pd.DataFrame(rows, columns=["col","n_unique","%NaN"]).sort_values("n_unique", ascending=False)
-    print(res.head(TOP_K).to_string(index=False))
-    for c in [x for x in cat_cols if x != COMPANY_COL][:10]:
-        print(f"\nTop modalités - {c}:")
-        print(df[c].value_counts(dropna=False).head(SHOW_TOP_CATS))
+def compare_train_test_over_time(train: pd.DataFrame, test: pd.DataFrame):
+    hr()
+    print("[TRAIN vs TEST] Comptes par année & par mois")
+    for freq, label in [("Y", "Année"), ("M", "Mois")]:
+        tr = train[DATE_COL].dt.to_period(freq).value_counts().sort_index()
+        te = test [DATE_COL].dt.to_period(freq).value_counts().sort_index()
+        df = pd.DataFrame({"train": tr, "test": te}).fillna(0).astype(int)
+        print(f"\n{label}:")
+        print(df.tail(24).to_string())
 
-def numeric_summary(df: pd.DataFrame, name: str, num_cols):
-    hrule()
-    print(f"[RÉSUMÉ NUMÉRIQUES] {name}")
-    use_cols = [c for c in num_cols if c in df.columns and c not in (ID_COL,)]
-    if not use_cols:
-        print("Aucune colonne numérique à résumer."); return
-    stats = []
-    for c in use_cols:
-        v = pd.to_numeric(df[c], errors="coerce").replace([np.inf,-np.inf], np.nan)
-        cnt = int(v.count())
-        if cnt == 0:
-            stats.append([c,0,np.nan,np.nan,np.nan,np.nan,np.nan,np.nan,"100.00%","0.00%"]); continue
-        q1 = v.quantile(0.01); q99 = v.quantile(0.99)
-        stats.append([
-            c, cnt, float(v.min()), float(v.max()),
-            float(v.mean()), float(v.std()),
-            float(q1) if pd.notna(q1) else np.nan,
-            float(q99) if pd.notna(q99) else np.nan,
-            f"{(v.isna().mean()*100):.2f}%",
-            f"{(v.eq(0).mean()*100):.2f}%"
-        ])
-    cols = ["col","count","min","max","mean","std","p01","p99","%NaN","%zero"]
-    dfstats = pd.DataFrame(stats, columns=cols).sort_values(by=["%NaN","std"], ascending=[False, False])
-    print(dfstats.head(TOP_K).to_string(index=False))
-
-def target_report(train: pd.DataFrame):
-    hrule()
-    print("[CIBLE] log_CDS_5Y (train)")
-    if "log_CDS_5Y" not in train.columns:
+def target_time_aggregates(train: pd.DataFrame):
+    hr()
+    print("[CIBLE] Agrégats temporels globaux")
+    if TARGET not in train.columns:
         print("Cible absente."); return
-    s = pd.to_numeric(train["log_CDS_5Y"], errors="coerce").replace([np.inf,-np.inf], np.nan)
-    print(f"Non-nuls : {s.notna().sum()} / {len(s)} ; NaN : {s.isna().sum()}")
-    print(f"Min={s.min():.6f} | P1={s.quantile(0.01):.6f} | P50={s.median():.6f} | P99={s.quantile(0.99):.6f} | Max={s.max():.6f} | Mean={s.mean():.6f} | Std={s.std():.6f}")
+    tmp = train[[DATE_COL, TARGET]].dropna().copy()
+    tmp["month"] = tmp[DATE_COL].dt.to_period("M")
 
-def range_sanity_checks(df: pd.DataFrame, name: str):
-    hrule()
-    print(f"[SANITY CHECKS DE PLAGES] {name}")
-    for col, (lo, hi) in RANGE_RULES.items():
-        if col in df.columns:
-            s = pd.to_numeric(df[col], errors="coerce")
-            n = len(s); below = (s < lo).sum(); above = (s > hi).sum(); nan = s.isna().sum()
-            print(f"{col}: [{lo}, {hi}] | below={below} ({below/n:.2%}) | above={above} ({above/n:.2%}) | NaN={nan} ({nan/n:.2%})")
+    monthly = tmp.groupby("month")[TARGET].agg(["count","mean","median","std","min","max"])
+    yearly  = tmp.groupby(tmp[DATE_COL].dt.year)[TARGET].agg(["count","mean","median","std","min","max"])
 
-def compare_train_test_levels(train: pd.DataFrame, test: pd.DataFrame, cat_cols):
-    hrule()
-    print("[COMPARAISON TRAIN vs TEST - Catégorielles]")
-    cat_cols = [c for c in cat_cols if c not in (ID_COL, COMPANY_COL)]  # exclut Company + Id
-    for c in cat_cols:
-        if c not in train.columns and c not in test.columns: 
-            continue
-        tr = set(train[c].dropna().astype(str).unique()) if c in train.columns else set()
-        te = set(test[c].dropna().astype(str).unique()) if c in test.columns else set()
-        new_in_test = te - tr
-        missing_in_test = tr - te
-        print(f"{c}: train#={len(tr)} | test#={len(te)} | nouvelles_mod={len(new_in_test)} | absentes_dans_test={len(missing_in_test)}")
-        if new_in_test:
-            print(f"  -> Exemples nouvelles (test pas dans train): {list(sorted(new_in_test))[:SHOW_TOP_CATS]}")
-        if missing_in_test:
-            print(f"  -> Exemples absentes (train pas dans test): {list(sorted(missing_in_test))[:SHOW_TOP_CATS]}")
+    print("\nPar MOIS (derniers 24):")
+    print(monthly.tail(24).to_string())
+    print("\nPar ANNÉE:")
+    print(yearly.to_string())
 
-def numeric_vs_target_corr(train: pd.DataFrame, num_cols: list):
-    if "log_CDS_5Y" not in train.columns: 
+    # Mois avec rupture locale (variation absolue de la moyenne m/m)
+    m = monthly["mean"].astype(float)
+    delta = (m - m.shift(1)).abs()
+    print("\nTop 10 variations absolues de moyenne m/m (changements potentiels de régime):")
+    print(delta.sort_values(ascending=False).head(10).to_string())
+
+def temporal_ranks_stability(train: pd.DataFrame, col: str):
+    if col not in train.columns or TARGET not in train.columns:
         return
-    hrule()
-    print("[CORRÉLATION SPEARMAN vs CIBLE] (numériques)")
-    corr = {}
-    y = pd.to_numeric(train["log_CDS_5Y"], errors="coerce")
-    for c in num_cols:
-        if c not in train.columns or c in (ID_COL,):
+    hr()
+    print(f"[STABILITÉ DE CLASSEMENT] {col} — Spearman année t vs t+1")
+    df = train[[DATE_COL, col, TARGET]].dropna().copy()
+    df["year"] = df[DATE_COL].dt.year
+    # moyenne cible par année x catégorie
+    pivot = df.groupby(["year", col])[TARGET].mean().reset_index()
+    years = sorted(pivot["year"].unique())
+    rows = []
+    for t, t1 in zip(years, years[1:]):
+        a = pivot[pivot["year"]==t].set_index(col)[TARGET]
+        b = pivot[pivot["year"]==t1].set_index(col)[TARGET]
+        common = a.index.intersection(b.index)
+        if len(common) < 3:
             continue
-        try:
-            rho = train[[c]].assign(y=y).corr(method="spearman").iloc[0,1]
-            corr[c] = rho
-        except Exception:
-            pass
-    if corr:
-        s = pd.Series(corr).dropna().sort_values(key=lambda x: x.abs(), ascending=False)
-        print(s.head(TOP_K))
+        rho = a.loc[common].rank().corr(b.loc[common].rank(), method="spearman")
+        rows.append((t, t1, len(common), rho))
+    if rows:
+        out = pd.DataFrame(rows, columns=["year_t","year_t1","n_common","spearman_rank_corr"])
+        print(out.to_string(index=False))
+        print("\nMoyenne corrélation de rangs:", out["spearman_rank_corr"].mean())
     else:
-        print("Aucune corrélation calculable.")
+        print("Pas assez de catégories communes entre années consécutives.")
+
+def macro_lagged_correlations(train: pd.DataFrame):
+    hr()
+    print("[MACRO] Corrélations cible (moyenne globale) vs macro (lags 0–6 mois)")
+    # Série cible agrégée globale par mois
+    if TARGET not in train.columns:
+        print("Cible absente."); return
+    tmp = train[[DATE_COL, TARGET] + [c for c in MACRO_CANDIDATES if c in train.columns]].dropna(subset=[DATE_COL]).copy()
+    tmp["month"] = tmp[DATE_COL].dt.to_period("M")
+
+    y_m = tmp.groupby("month")[TARGET].mean()
+
+    # macro moyennées par mois (moyenne sur toutes les lignes du mois)
+    res_rows = []
+    for col in [c for c in MACRO_CANDIDATES if c in tmp.columns]:
+        x_m = tmp.groupby("month")[col].mean()
+        # align
+        df = pd.concat([y_m, x_m], axis=1, join="inner").dropna()
+        if df.empty:
+            continue
+        for lag in range(0, 7):  # macro à t-lag → corrèle avec cible t
+            y = df[TARGET]
+            x = x_m.reindex(df.index).shift(lag)
+            z = pd.concat([y, x], axis=1).dropna()
+            if len(z) < 12:
+                continue
+            r = z[TARGET].corr(z[col])
+            res_rows.append((col, lag, len(z), r))
+    if res_rows:
+        res = pd.DataFrame(res_rows, columns=["macro_col","lag_months","n_pts","pearson_corr"])
+        # Top corrélations par macro (en valeur absolue)
+        top = res.sort_values(by="pearson_corr", key=lambda s: s.abs(), ascending=False).groupby("macro_col").head(1)
+        print("Top corrélations par macro (lag optimal 0–6):")
+        print(top.sort_values(by="pearson_corr", key=lambda s: s.abs(), ascending=False).to_string(index=False))
+        print("\nAperçu complet (top 25 absolus):")
+        print(res.sort_values(by="pearson_corr", key=lambda s: s.abs(), ascending=False).head(25).to_string(index=False))
+    else:
+        print("Aucune combinaison exploitable.")
+
+def rolling_volatility_of_target(train: pd.DataFrame, window=6):
+    hr()
+    print(f"[VOLATILITÉ ROLLING] Moyenne globale par mois — fenêtre={window} mois")
+    if TARGET not in train.columns:
+        print("Cible absente."); return
+    tmp = train[[DATE_COL, TARGET]].dropna().copy()
+    tmp["month"] = tmp[DATE_COL].dt.to_period("M")
+    y_m = tmp.groupby("month")[TARGET].mean().astype(float)
+    vol = y_m.pct_change().rolling(window).std()
+    tab = pd.DataFrame({"y_mean": y_m, "pct_change": y_m.pct_change(), f"roll_std_{window}m": vol})
+    print(tab.tail(24).to_string())
+    print("\nTop 10 pics de volatilité rolling:")
+    print(vol.sort_values(ascending=False).head(10).to_string())
+
+def feature_temporal_variability(train: pd.DataFrame):
+    hr()
+    print("[VARIABILITÉ TEMPORELLE DES FEATURES] (hors catégorielles, hors Id, hors cible)")
+    num_cols = []
+    for c, dt in train.dtypes.items():
+        if c in (ID_COL, DATE_COL, TARGET) or (c in CAT_COLS):
+            continue
+        if pd.api.types.is_numeric_dtype(dt):
+            num_cols.append(c)
+    if DATE_COL not in train.columns or not num_cols:
+        print("Rien à évaluer."); return
+
+    df = train[[DATE_COL] + num_cols].copy()
+    df["month"] = df[DATE_COL].dt.to_period("M")
+
+    rows = []
+    for c in num_cols:
+        # variabilité dans le temps de la moyenne mensuelle et dispersion intra-mois
+        m_by_t = df.groupby("month")[c].mean()
+        v_time = m_by_t.std()
+        intra = df.groupby("month")[c].std().mean()
+        rows.append((c, float(v_time), float(intra)))
+    out = pd.DataFrame(rows, columns=["feature","std_of_monthly_mean","mean_intra_month_std"])
+    # Indice de "sensibilité temporelle": ratio std_temps / (intra + 1e-9)
+    out["temporal_sensitivity"] = out["std_of_monthly_mean"] / (out["mean_intra_month_std"] + 1e-9)
+    print("Top 20 features sensibles au temps (std_monthly_mean élevé / intra-mois):")
+    print(out.sort_values(by="temporal_sensitivity", ascending=False).head(20).to_string(index=False))
 
 def main():
-    train, test = load_all()
+    train, test = load_data()
 
-    basic_integrity_checks(train, "TRAIN (X+y)")
-    basic_integrity_checks(test , "TEST (X)")
+    # 1) Couverture
+    coverage(train, "TRAIN")
+    coverage(test , "TEST")
 
-    num_tr, cat_tr, _ = classify_columns(train)
-    num_te, cat_te, _ = classify_columns(test)
+    # 2) Train vs Test sur le temps
+    compare_train_test_over_time(train, test)
 
-    hrule(); print("[CLASSIFICATION COLONNES] TRAIN")
-    print("Numériques (top):", num_tr[:TOP_K])
-    print("Catégorielles (top):", cat_tr[:TOP_K])
+    # 3) Cible dans le temps (globale)
+    target_time_aggregates(train)
 
-    hrule(); print("[CLASSIFICATION COLONNES] TEST")
-    print("Numériques (top):", num_te[:TOP_K])
-    print("Catégorielles (top):", cat_te[:TOP_K])
+    # 4) Stabilité des classements par catégories
+    for c in CAT_COLS:
+        temporal_ranks_stability(train, c)
 
-    hrule(); print("[COHÉRENCE COLONNES TRAIN vs TEST]")
-    cols_tr = set(train.columns) - {"log_CDS_5Y"}
-    cols_te = set(test.columns)
-    only_tr = sorted(list(cols_tr - cols_te))
-    only_te = sorted(list(cols_te - cols_tr))
-    print("Colonnes seulement dans TRAIN (hors cible):", only_tr[:TOP_K])
-    print("Colonnes seulement dans TEST:", only_te[:TOP_K])
+    # 5) Macro ↔ cible (lags)
+    macro_lagged_correlations(train)
 
-    missingness_report(train, "TRAIN")
-    missingness_report(test , "TEST")
+    # 6) Volatilité rolling de la cible (globale)
+    rolling_volatility_of_target(train, window=6)
 
-    cat_union = sorted(set(cat_tr).union(cat_te))
-    cardinality_report(train, "TRAIN", cat_union)
-    cardinality_report(test , "TEST" , cat_union)
+    # 7) Variabilité temporelle des features numériques
+    feature_temporal_variability(train)
 
-    num_union = sorted(set(num_tr).union(num_te))
-    numeric_summary(train, "TRAIN", num_union)
-    numeric_summary(test , "TEST" , num_union)   # robuste si certaines colonnes manquent
-
-    target_report(train)
-    range_sanity_checks(train, "TRAIN")
-    range_sanity_checks(test , "TEST")
-    compare_train_test_levels(train, test, cat_union)
-    numeric_vs_target_corr(train, num_union)
-
-    hrule(); print("FIN DU POINT 1.")
-    hrule()
+    hr()
+    print("FIN – Analyse temporelle")
 
 if __name__ == "__main__":
     main()
