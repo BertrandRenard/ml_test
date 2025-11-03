@@ -1,0 +1,61 @@
+# pip install pulp pandas
+import pandas as pd
+import pulp as pl
+
+# df: DataFrame avec colonnes ['entite','label','controle'] (couples uniques)
+# Paramètres d'entrée
+tau = 0.80
+preselected_entities = set([...])  # ex: {'E1','E7'}
+preselected_labels = set([...])    # ex: {'L3'}
+epsilon = 1e-6
+
+# --- Préparation des ensembles et données ---
+E = sorted(df['entite'].unique())
+L = sorted(df['label'].unique())
+P = list(df[['entite','label','controle']].itertuples(index=False, name=None))
+C_tot = df['controle'].sum()
+
+# --- Modèle ---
+m = pl.LpProblem("Coverage80_MinEntitiesLabels", pl.LpMinimize)
+
+# Variables
+y = pl.LpVariable.dicts("y", E, lowBound=0, upBound=1, cat="Binary")
+z = pl.LpVariable.dicts("z", L, lowBound=0, upBound=1, cat="Binary")
+x = {
+    (e,l): pl.LpVariable(f"x_{e}__{l}", lowBound=0, upBound=1, cat="Binary")
+    for (e,l,_) in P
+}
+
+# Couverture
+m += pl.lpSum(c * x[(e,l)] for (e,l,c) in P) >= tau * C_tot
+
+# Cohérence couples -> entités/labels
+for (e,l,_) in P:
+    m += x[(e,l)] <= y[e]
+    m += x[(e,l)] <= z[l]
+
+# Inclusion imposée
+for e in preselected_entities:
+    if e in y: m += y[e] == 1
+for l in preselected_labels:
+    if l in z: m += z[l] == 1
+
+# Objectif
+m += pl.lpSum(y[e] for e in E) + pl.lpSum(z[l] for l in L) \
+     + epsilon * pl.lpSum(x[(e,l)] for (e,l,_) in P)
+
+# Résolution
+m.solve(pl.PULP_CBC_CMD(msg=False))
+
+# --- Sorties principales ---
+status = pl.LpStatus[m.status]
+selected_pairs = [(e,l) for (e,l,_) in P if pl.value(x[(e,l)]) > 0.5]
+selected_entities = [e for e in E if pl.value(y[e]) > 0.5]
+selected_labels = [l for l in L if pl.value(z[l]) > 0.5]
+covered = sum(c for (e,l,c) in P if pl.value(x[(e,l)]) > 0.5)
+coverage = covered / C_tot if C_tot > 0 else 0.0
+
+print("Status:", status)
+print("Couverture:", round(coverage*100,2), "% (", covered, "/", C_tot, ")")
+print("# Entités:", len(selected_entities), " | # Labels:", len(selected_labels),
+      " | # Couples:", len(selected_pairs))
