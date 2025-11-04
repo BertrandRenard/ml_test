@@ -1,87 +1,71 @@
 # -*- coding: utf-8 -*-
-# Minimiser le cardinal du produit cartésien E_sel × L_sel
-# avec couverture τ des contrôles et présélections d'entités/labels.
-#
-# df : DataFrame colonnes ['entite','label','controle'] (certaines paires peuvent manquer)
-# Nécessite : pip install pulp pandas
+# Rectangle plein : couverture portée sur u = y*z (x supprimé)
+# df: colonnes ['entite','label','controle'] avec certaines paires éventuellement manquantes
+# Nécessite: pip install pulp pandas
 
 import pandas as pd
 import pulp as pl
 
-def solve_min_cartesian_product(
+def solve_full_rectangle(
     df: pd.DataFrame,
     tau: float = 0.80,
     preselected_entities=None,
     preselected_labels=None,
+    objective: str = "product",  # "product" ou "entities_labels"
     time_limit: int = 300,
     frac_gap: float | None = None,
     verbose: bool = True,
 ):
-    """
-    Résout :
-      - Variables : y_e, z_l, u_{e,l} (sur E×L), x_{e,l} (seulement sur Paires existantes P)
-      - Objectif : min sum_{e in E} sum_{l in L} u_{e,l}
-      - Couverture : sum_{(e,l) in P} c_{e,l} x_{e,l} >= tau * C_tot
-      - Liens : x_{e,l} <= y_e, x_{e,l} <= z_l,  u linéarise y*z sur E×L
-      - Pré-sélections : y_e=1 pour e in E*, z_l=1 pour l in L*
-    Retourne un dict avec la solution et des métriques.
-    """
-
-    # --- Préparation des ensembles ---
     df = df.copy()
     df['controle'] = df['controle'].astype(float)
 
     E = sorted(df['entite'].unique())
     L = sorted(df['label'].unique())
 
-    # Paires existantes (seulement celles présentes dans le DF)
-    c = {(r.entite, r.label): float(r.controle) for r in df.itertuples(index=False)}
-    P = list(c.keys())
-    Ctot = sum(c.values())
+    # Construire c_{e,l} sur tout E×L, 0 si paire absente
+    c = {(e,l): 0.0 for e in E for l in L}
+    for r in df.itertuples(index=False):
+        c[(r.entite, r.label)] = float(r.controle)
 
+    Ctot = sum(c.values())
     if Ctot <= 0:
         raise ValueError("Somme des contrôles nulle. Rien à couvrir.")
 
     E_star = set(preselected_entities or [])
     L_star = set(preselected_labels or [])
 
-    # --- Modèle ---
-    m = pl.LpProblem("Min_Cartesian_Product_with_Coverage", pl.LpMinimize)
+    m = pl.LpProblem("FullRectangle_Coverage", pl.LpMinimize)
 
     # Variables
-    y = pl.LpVariable.dicts("y", E, lowBound=0, upBound=1, cat="Binary")
-    z = pl.LpVariable.dicts("z", L, lowBound=0, upBound=1, cat="Binary")
-    x = {p: pl.LpVariable(f"x_{p[0]}__{p[1]}", lowBound=0, upBound=1, cat="Binary") for p in P}
-    # u sur tout E×L (même pour paires inexistantes)
-    u = {(e,l): pl.LpVariable(f"u_{e}__{l}", lowBound=0, upBound=1, cat="Binary") for e in E for l in L}
+    y = pl.LpVariable.dicts("y", E, 0, 1, cat="Binary")
+    z = pl.LpVariable.dicts("z", L, 0, 1, cat="Binary")
+    u = {(e,l): pl.LpVariable(f"u_{e}__{l}", 0, 1, cat="Binary") for e in E for l in L}
 
-    # 1) Couverture (sur P)
-    m += pl.lpSum(c[(e,l)] * x[(e,l)] for (e,l) in P) >= tau * Ctot, "couverture"
+    # Couverture sur u
+    m += pl.lpSum(c[(e,l)] * u[(e,l)] for e in E for l in L) >= tau * Ctot, "couverture"
 
-    # 2) x => y,z (sur P)
-    for (e,l) in P:
-        m += x[(e,l)] <= y[e], f"x_le_y__{e}__{l}"
-        m += x[(e,l)] <= z[l], f"x_le_z__{e}__{l}"
-
-    # 3) Linéarisation u = y * z (sur E×L)
+    # Linéarisation u = y * z
     for e in E:
         for l in L:
             m += u[(e,l)] <= y[e], f"u_le_y__{e}__{l}"
             m += u[(e,l)] <= z[l], f"u_le_z__{e}__{l}"
             m += u[(e,l)] >= y[e] + z[l] - 1, f"u_ge_ypluszminus1__{e}__{l}"
 
-    # 4) Pré-sélections
+    # Pré-sélections
     for e in E_star:
-        if e in y:
-            m += y[e] == 1, f"preselect_entity__{e}"
+        m += y[e] == 1, f"preselect_entity__{e}"
     for l in L_star:
-        if l in z:
-            m += z[l] == 1, f"preselect_label__{l}"
+        m += z[l] == 1, f"preselect_label__{l}"
 
-    # Objectif : minimiser |E_sel| * |L_sel| (cardinal du produit cartésien)
-    m += pl.lpSum(u[(e,l)] for e in E for l in L), "min_cartesian_cardinality"
+    # Objectif
+    if objective == "product":
+        # Minimiser |E_sel|×|L_sel| (via sum u)
+        m += pl.lpSum(u[(e,l)] for e in E for l in L), "min_cartesian_cardinality"
+    elif objective == "entities_labels":
+        m += pl.lpSum(y[e] for e in E) + pl.lpSum(z[l] for l in L), "min_entities_plus_labels"
+    else:
+        raise ValueError("objective doit être 'product' ou 'entities_labels'")
 
-    # Solveur CBC avec limites
     solver = pl.PULP_CBC_CMD(
         msg=bool(verbose),
         timeLimit=int(time_limit) if time_limit else None,
@@ -90,58 +74,36 @@ def solve_min_cartesian_product(
     status_code = m.solve(solver)
     status = pl.LpStatus.get(status_code, str(status_code))
 
-    # --- Extraction robuste (tolérance numérique) ---
-    def is_one(val: float, thresh: float = 0.5) -> bool:
-        try:
-            return float(val) > thresh
-        except Exception:
-            return False
+    def is_one(v, thr=0.5): 
+        try: return float(pl.value(v)) > thr
+        except: return False
 
-    y_sel = [e for e in E if is_one(pl.value(y[e]))]
-    z_sel = [l for l in L if is_one(pl.value(z[l]))]
-    x_sel = [(e,l) for (e,l) in P if is_one(pl.value(x[(e,l)]))]
-    u_sum = sum(1 for e in E for l in L if is_one(pl.value(u[(e,l)])))
+    y_sel = [e for e in E if is_one(y[e])]
+    z_sel = [l for l in L if is_one(z[l])]
+    u_sel = [(e,l) for e in E for l in L if is_one(u[(e,l)])]
 
-    covered = sum(c[(e,l)] for (e,l) in x_sel)
+    covered = sum(c[(e,l)] for (e,l) in u_sel)
     coverage = covered / Ctot
-
-    # Métriques complémentaires
     obj_val = pl.value(m.objective)
-    yz_count = len(y_sel) * len(z_sel)  # devrait coïncider avec u_sum si tout E×L est bien linéarisé
-    gap = None
-    try:
-        # CBC n'expose pas toujours le gap ; on peut l’estimer si besoin via solver messages.
-        pass
-    except Exception:
-        pass
 
     if verbose:
         print("Status :", status)
-        print(f"Objectif (|E_sel|×|L_sel| via u)  : {obj_val:.0f}")
-        print(f"|E_sel|={len(y_sel)}, |L_sel|={len(z_sel)}, produit={len(y_sel)*len(z_sel)} ; somme u = {u_sum}")
+        if objective == "product":
+            print(f"Objectif (|E_sel|×|L_sel| via sum u) : {obj_val:.0f}")
+        else:
+            print(f"Objectif (|E_sel| + |L_sel|) : {obj_val:.0f}")
+        print(f"|E_sel|={len(y_sel)}, |L_sel|={len(z_sel)}, produit={len(y_sel)*len(z_sel)}, somme_u={len(u_sel)}")
         print(f"Couverture : {coverage*100:.2f}%  ({covered} / {Ctot})")
-        print(f"# couples x sélectionnés : {len(x_sel)}")
 
     return {
         "status": status,
-        "objective_u_sum": obj_val,
+        "objective_value": obj_val,
         "E_selected": y_sel,
         "L_selected": z_sel,
-        "pairs_selected": x_sel,
-        "u_sum": u_sum,
-        "cartesian_product_size": yz_count,
+        "pairs_active_rectangle": u_sel,
+        "cartesian_product_size": len(y_sel) * len(z_sel),
+        "sum_u": len(u_sel),
         "coverage_ratio": coverage,
         "covered_controls": covered,
         "total_controls": Ctot,
     }
-
-# -----------------------------
-# Exemple d'utilisation :
-# df = pd.read_csv("donnees.csv")  # colonnes: entite,label,controle
-# res = solve_min_cartesian_product(
-#     df, tau=0.80,
-#     preselected_entities={'E1','E7'},
-#     preselected_labels={'L3'},
-#     time_limit=300, frac_gap=0.01, verbose=True
-# )
-# print(res["E_selected"], res["L_selected"])
